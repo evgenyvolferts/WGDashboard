@@ -1,17 +1,29 @@
 """
 WireGuard Configuration
 """
-from typing import Any
-
-import jinja2
-import sqlalchemy, random, shutil, configparser, ipaddress, os, subprocess, time, re, uuid, psutil, traceback
-from zipfile import ZipFile
 from datetime import datetime, timedelta
 from itertools import islice
+from typing import Any
+from zipfile import ZipFile
+
+import configparser
+import ipaddress
+import jinja2
+import os
+import psutil
+import random
+import re
+import shutil
+import sqlalchemy
+import subprocess
+import time
+import traceback
+import uuid
 from flask import current_app
 
-from .DatabaseConnection import ConnectionString
 from .DashboardConfig import DashboardConfig
+from .DashboardWebHooks import DashboardWebHooks
+from .DatabaseConnection import ConnectionString
 from .Peer import Peer
 from .PeerJobs import PeerJobs
 from .PeerShareLinks import PeerShareLinks
@@ -23,7 +35,6 @@ from .Utilities import StringToBoolean, \
     CheckAddress, \
     CheckPeerKey
 from .WireguardConfigurationInfo import WireguardConfigurationInfo, PeerGroupsClass
-from .DashboardWebHooks import DashboardWebHooks
 
 
 class WireguardConfiguration:
@@ -154,7 +165,7 @@ class WireguardConfiguration:
                 current_app.logger.error(f"Failed to autostart configuration: {name}. Reason: {ext}")
             else:
                 current_app.logger.info(f"Autostart Configuration: {name}")
-            
+
         self.configurationInfo: WireguardConfigurationInfo | None = None
         configurationInfoJson = self.readConfigurationInfo()
         if not configurationInfoJson:
@@ -162,7 +173,7 @@ class WireguardConfiguration:
             self.initConfigurationInfo()
         else:
             self.configurationInfo = WireguardConfigurationInfo.model_validate_json(configurationInfoJson.get("Info"))
-        
+
         if self.Status:
             self.addAutostart()
 
@@ -241,7 +252,7 @@ class WireguardConfiguration:
             self.Status = self.getStatus()
 
     def __dropDatabase(self):
-        existingTables = [self.Name, f'{self.Name}_restrict_access', f'{self.Name}_transfer', f'{self.Name}_deleted', f'{self.Name}_history_endpoint']
+        existingTables = [self.Name, f'{self.Name}_runtime', f'{self.Name}_restrict_access', f'{self.Name}_transfer', f'{self.Name}_deleted', f'{self.Name}_history_endpoint']
         try:
             with self.engine.begin() as conn:
                 for t in existingTables:
@@ -283,8 +294,27 @@ class WireguardConfiguration:
         if dbName is None:
             dbName = self.Name
 
+        # Restricted and deleted peers keep the complete snapshot schema.
+        def generate_peer_column_obj():
+            return [
+                column for column in generate_column_obj()
+                if column.name not in ("endpoint", "status", "latest_handshake")
+            ]
+
+        def generate_peer_runtime_column_obj():
+            return [
+                sqlalchemy.Column('id', sqlalchemy.String(255), nullable=False, primary_key=True),
+                sqlalchemy.Column('endpoint', sqlalchemy.String(255)),
+                sqlalchemy.Column('status', sqlalchemy.String(255)),
+                sqlalchemy.Column('latest_handshake', sqlalchemy.String(255))
+            ]
+
         self.peersTable = sqlalchemy.Table(
-            f'{dbName}', self.metadata, *generate_column_obj(), extend_existing=True
+            f'{dbName}', self.metadata, *generate_peer_column_obj(), extend_existing=True
+        )
+
+        self.peersRuntimeTable = sqlalchemy.Table(
+            f'{dbName}_runtime', self.metadata, *generate_peer_runtime_column_obj(), extend_existing=True
         )
 
         self.peersRestrictedTable = sqlalchemy.Table(
@@ -312,7 +342,7 @@ class WireguardConfiguration:
             sqlalchemy.Column('time', time_col_type, server_default=sqlalchemy.func.now()),
             extend_existing=True
         )
-        
+
         self.peersHistoryEndpointTable = sqlalchemy.Table(
             f'{dbName}_history_endpoint', self.metadata,
             sqlalchemy.Column('id', sqlalchemy.String(255), nullable=False),
@@ -320,7 +350,7 @@ class WireguardConfiguration:
             sqlalchemy.Column('time', time_col_type),
             extend_existing=True
         )
-        
+
         self.infoTable = sqlalchemy.Table(
             'ConfigurationsInfo', self.metadata,
             sqlalchemy.Column('ID', sqlalchemy.String(255), primary_key=True),
@@ -332,14 +362,14 @@ class WireguardConfiguration:
 
     def __dumpDatabase(self):
         with self.engine.connect() as conn:
-            tables = [self.peersTable, self.peersRestrictedTable, self.peersTransferTable, self.peersDeletedTable]
+            tables = [self.peersTable, self.peersRuntimeTable, self.peersRestrictedTable, self.peersTransferTable, self.peersDeletedTable]
             for i in tables:
                 rows = conn.execute(i.select()).mappings().fetchall()
                 for row in rows:
                     insert_stmt = i.insert().values(dict(row))
                     yield str(insert_stmt.compile(compile_kwargs={"literal_binds": True}))
 
-    def __importDatabase(self, sqlFilePath, restore = False) -> bool:
+    def __importDatabase(self, sqlFilePath, restore=False) -> bool:
         if not restore:
             self.__dropDatabase()
         self.createDatabase()
@@ -363,34 +393,53 @@ class WireguardConfiguration:
     def getAutostartStatus(self):
         s, d = self.DashboardConfig.GetConfig("WireGuardConfiguration", "autostart")
         return self.Name in d
-    
+
     def addAutostart(self):
         s, d = self.DashboardConfig.GetConfig("WireGuardConfiguration", "autostart")
         if self.Name not in d:
             d.append(self.Name)
             self.DashboardConfig.SetConfig("WireGuardConfiguration", "autostart", d)
-    
+
     def removeAutostart(self):
         s, d = self.DashboardConfig.GetConfig("WireGuardConfiguration", "autostart")
         if self.Name in d:
             d.remove(self.Name)
             self.DashboardConfig.SetConfig("WireGuardConfiguration", "autostart", d)
 
+    def _createPeer(self, data):
+        return Peer(data, self)
+
+    def _getPeersWithRuntime(self, conn, where=None):
+        stmt = sqlalchemy.select(
+            self.peersTable,
+            self.peersRuntimeTable.c.endpoint,
+            self.peersRuntimeTable.c.status,
+            self.peersRuntimeTable.c.latest_handshake
+        ).select_from(
+            self.peersTable.outerjoin(
+                self.peersRuntimeTable,
+                self.peersTable.c.id == self.peersRuntimeTable.c.id
+            )
+        )
+        if where is not None:
+            stmt = stmt.where(where)
+        return conn.execute(stmt).mappings()
+
     def getRestrictedPeers(self):
         self.RestrictedPeers = []
         with self.engine.connect() as conn:
             restricted = conn.execute(self.peersRestrictedTable.select()).mappings().fetchall()
             for i in restricted:
-                self.RestrictedPeers.append(Peer(i, self))
+                self.RestrictedPeers.append(self._createPeer(i))
 
-    def configurationFileChanged(self) :
+    def configurationFileChanged(self):
         mt = os.path.getmtime(self.configPath)
         changed = self.__configFileModifiedTime is None or self.__configFileModifiedTime != mt
         self.__configFileModifiedTime = mt
         return changed
 
     def getPeers(self):
-        tmpList = []        
+        tmpList = []
         if self.configurationFileChanged():
             with open(self.configPath, 'r') as configFile:
                 p = []
@@ -420,29 +469,25 @@ class WireguardConfiguration:
                             split = re.split(r'\s*=\s*', i, 1)
                             if len(split) == 2:
                                 p[pCounter]["name"] = split[1]
-                    
+
                     for i in p:
                         if "PublicKey" in i.keys():
                             with self.engine.connect() as conn:
-                                tempPeer = conn.execute(
-                                    self.peersTable.select().where(
-                                        self.peersTable.columns.id == i['PublicKey']
-                                    )
-                                ).mappings().fetchone()
-                            
+                                tempPeer = self._getPeersWithRuntime(
+                                    conn, self.peersTable.c.id == i['PublicKey']
+                                ).fetchone()
+
                             if tempPeer is None:
                                 tempPeer = {
                                     "id": i['PublicKey'],
                                     "private_key": "",
                                     "DNS": self.DashboardConfig.GetConfig("Peers", "peer_global_DNS")[1],
-                                    "endpoint_allowed_ip": self.DashboardConfig.GetConfig("Peers", "peer_endpoint_allowed_ip")[1],
+                                    "endpoint_allowed_ip":
+                                        self.DashboardConfig.GetConfig("Peers", "peer_endpoint_allowed_ip")[1],
                                     "name": i.get("name"),
                                     "total_receive": 0,
                                     "total_sent": 0,
                                     "total_data": 0,
-                                    "endpoint": "N/A",
-                                    "status": "stopped",
-                                    "latest_handshake": "N/A",
                                     "allowed_ip": i.get("AllowedIPs", "N/A"),
                                     "cumu_receive": 0,
                                     "cumu_sent": 0,
@@ -456,7 +501,15 @@ class WireguardConfiguration:
                                 with self.engine.begin() as conn:
                                     conn.execute(
                                         self.peersTable.insert().values(tempPeer)
-                                    )                                    
+                                    )
+                                    conn.execute(
+                                        self.peersRuntimeTable.insert().values({
+                                            "id": i['PublicKey'],
+                                            "endpoint": "N/A",
+                                            "status": "stopped",
+                                            "latest_handshake": "N/A"
+                                        })
+                                    )
                             else:
                                 with self.engine.begin() as conn:
                                     conn.execute(
@@ -466,16 +519,20 @@ class WireguardConfiguration:
                                             self.peersTable.columns.id == i['PublicKey']
                                         )
                                     )
-                            tmpList.append(Peer(tempPeer, self))
+                            with self.engine.connect() as conn:
+                                tempPeer = self._getPeersWithRuntime(
+                                    conn, self.peersTable.c.id == i['PublicKey']
+                                ).fetchone()
+                            tmpList.append(self._createPeer(tempPeer))
                 except Exception as e:
                     current_app.logger.error(f"{self.Name} getPeers() Error", e)
         else:
             with self.engine.connect() as conn:
-                existingPeers = conn.execute(self.peersTable.select()).mappings().fetchall()
+                existingPeers = self._getPeersWithRuntime(conn).fetchall()
                 for i in existingPeers:
-                    tmpList.append(Peer(i, self))
+                    tmpList.append(self._createPeer(i))
         self.Peers = tmpList
-    
+
     def logPeersTraffic(self):
         with self.engine.begin() as conn:
             for tempPeer in self.Peers:
@@ -492,12 +549,12 @@ class WireguardConfiguration:
                             "time": datetime.now()
                         })
                     )
-    
+
     def logPeersHistoryEndpoint(self):
         with self.engine.begin() as conn:
             for tempPeer in self.Peers:
                 if tempPeer.status == "running":
-                    endpoint = tempPeer.endpoint.rsplit(":", 1)    
+                    endpoint = tempPeer.endpoint.rsplit(":", 1)
                     if len(endpoint) == 2 and len(endpoint[0]) > 0:
                         exist = conn.execute(
                             self.peersHistoryEndpointTable.select().where(
@@ -515,7 +572,7 @@ class WireguardConfiguration:
                                     "time": datetime.now()
                                 })
                             )
-                          
+
     def addPeers(self, peers: list) -> tuple[bool, list, str]:
         result = {
             "message": None,
@@ -542,9 +599,6 @@ class WireguardConfiguration:
                         "total_receive": 0,
                         "total_sent": 0,
                         "total_data": 0,
-                        "endpoint": "N/A",
-                        "status": "stopped",
-                        "latest_handshake": "N/A",
                         "allowed_ip": i.get("allowed_ip", "N/A"),
                         "cumu_receive": 0,
                         "cumu_sent": 0,
@@ -558,6 +612,14 @@ class WireguardConfiguration:
                     conn.execute(
                         self.peersTable.insert().values(newPeer)
                     )
+                    conn.execute(
+                        self.peersRuntimeTable.insert().values({
+                            "id": i['id'],
+                            "endpoint": "N/A",
+                            "status": "stopped",
+                            "latest_handshake": "N/A"
+                        })
+                    )
             for p in peers:
                 presharedKeyExist = len(p['preshared_key']) > 0
                 rd = random.Random()
@@ -566,7 +628,8 @@ class WireguardConfiguration:
                     with open(uid, "w+") as f:
                         f.write(p['preshared_key'])
 
-                command = [self.Protocol, "set", self.Name, "peer", p['id'], "allowed-ips", cleanedAllowedIPs[p["id"]], "preshared-key", uid if presharedKeyExist else "/dev/null"]
+                command = [self.Protocol, "set", self.Name, "peer", p['id'], "allowed-ips", cleanedAllowedIPs[p["id"]],
+                           "preshared-key", uid if presharedKeyExist else "/dev/null"]
                 subprocess.check_output(command, stderr=subprocess.STDOUT)
 
                 if presharedKeyExist:
@@ -582,7 +645,7 @@ class WireguardConfiguration:
                     result['peers'].append(p[1])
             self.DashboardWebHooks.RunWebHook("peer_created", {
                 "configuration": self.Name,
-                "peers": list(map(lambda k : k['id'], peers))
+                "peers": list(map(lambda k: k['id'], peers))
             })
         except Exception as e:
             current_app.logger.error("Add peers error", e)
@@ -605,12 +668,20 @@ class WireguardConfiguration:
                 )
                 restrictedPeer = conn.execute(stmt).mappings().fetchone()
                 if restrictedPeer is not None:
-                    conn.execute(
-                        self.peersTable.insert().from_select(
-                            [c.name for c in self.peersTable.columns],
-                            stmt
+                    shared_columns = [c.name for c in self.peersTable.columns]
+                    runtime_columns = [c.name for c in self.peersRuntimeTable.columns]
+                    for target, columns in (
+                            (self.peersTable, shared_columns),
+                            (self.peersRuntimeTable, runtime_columns)
+                    ):
+                        conn.execute(
+                            target.insert().from_select(
+                                columns,
+                                sqlalchemy.select(
+                                    *(self.peersRestrictedTable.c[name] for name in columns)
+                                ).where(self.peersRestrictedTable.c.id == i)
+                            )
                         )
-                    )
                     conn.execute(
                         self.peersRestrictedTable.delete().where(
                             self.peersRestrictedTable.columns.id == i
@@ -631,7 +702,8 @@ class WireguardConfiguration:
                     if not CheckPeerKey(restrictedPeer["id"]):
                         return False, "Peer key format is incorrect"
 
-                    command = [self.Protocol, "set", self.Name, "peer", restrictedPeer["id"], "allowed-ips", newAllowedIPs, "preshared-key", uid if presharedKeyExist else "/dev/null"]
+                    command = [self.Protocol, "set", self.Name, "peer", restrictedPeer["id"], "allowed-ips",
+                               newAllowedIPs, "preshared-key", uid if presharedKeyExist else "/dev/null"]
                     subprocess.check_output(command, stderr=subprocess.STDOUT)
 
                     if presharedKeyExist: os.remove(uid)
@@ -656,12 +728,21 @@ class WireguardConfiguration:
                         command = [self.Protocol, "set", self.Name, "peer", pf.id, "remove"]
                         subprocess.check_output(command, stderr=subprocess.STDOUT)
 
+                        restricted_columns = [c.name for c in self.peersRestrictedTable.columns]
+                        runtime_column_names = {"endpoint", "status", "latest_handshake"}
+                        source_columns = [
+                            (self.peersRuntimeTable.c[name] if name in runtime_column_names else self.peersTable.c[name])
+                            for name in restricted_columns
+                        ]
                         conn.execute(
                             self.peersRestrictedTable.insert().from_select(
-                                [c.name for c in self.peersTable.columns],
-                                self.peersTable.select().where(
-                                    self.peersTable.columns.id == pf.id
-                                )
+                                restricted_columns,
+                                sqlalchemy.select(*source_columns).select_from(
+                                    self.peersTable.outerjoin(
+                                        self.peersRuntimeTable,
+                                        self.peersTable.c.id == self.peersRuntimeTable.c.id
+                                    )
+                                ).where(self.peersTable.c.id == pf.id)
                             )
                         )
                         conn.execute(
@@ -674,6 +755,11 @@ class WireguardConfiguration:
                         conn.execute(
                             self.peersTable.delete().where(
                                 self.peersTable.columns.id == pf.id
+                            )
+                        )
+                        conn.execute(
+                            self.peersRuntimeTable.delete().where(
+                                self.peersRuntimeTable.c.id == pf.id
                             )
                         )
                         numOfRestrictedPeers += 1
@@ -689,8 +775,8 @@ class WireguardConfiguration:
             return True, f"Restricted {numOfRestrictedPeers} peer(s)"
         return False, f"Restricted {numOfRestrictedPeers} peer(s) successfully. Failed to restrict {numOfFailedToRestrictPeers} peer(s)"
 
-
-    def deletePeers(self, listOfPublicKeys, AllPeerJobs: PeerJobs, AllPeerShareLinks: PeerShareLinks) -> tuple[bool, str]:
+    def deletePeers(self, listOfPublicKeys, AllPeerJobs: PeerJobs, AllPeerShareLinks: PeerShareLinks) -> tuple[
+        bool, str]:
         numOfDeletedPeers = 0
         numOfFailedToDeletePeers = 0
         deleted = []
@@ -712,6 +798,11 @@ class WireguardConfiguration:
                                 self.peersTable.columns.id == pf.id
                             )
                         )
+                        conn.execute(
+                            self.peersRuntimeTable.delete().where(
+                                self.peersRuntimeTable.c.id == pf.id
+                            )
+                        )
                         deleted.append(pf.id)
                         numOfDeletedPeers += 1
                     except Exception as e:
@@ -721,17 +812,17 @@ class WireguardConfiguration:
             return False, "Failed to save configuration through WireGuard"
 
         self.getPeers()
-        
+
         if numOfDeletedPeers == 0 and numOfFailedToDeletePeers == 0:
             return False, "No peer(s) to delete found"
-        
+
         if numOfDeletedPeers == len(listOfPublicKeys):
             self.DashboardWebHooks.RunWebHook("peer_deleted", {
                 "configuration": self.Name,
                 "peers": deleted
             })
             return True, f"Deleted {numOfDeletedPeers} peer(s)"
-        
+
         return False, f"Deleted {numOfDeletedPeers} peer(s) successfully. Failed to delete {numOfFailedToDeletePeers} peer(s)"
 
     def __wgSave(self) -> tuple[bool, str] | tuple[bool, None]:
@@ -766,20 +857,20 @@ class WireguardConfiguration:
                     status = "stopped"
                 if int(latestHandshake[count + 1]) > 0:
                     conn.execute(
-                        self.peersTable.update().values({
+                        self.peersRuntimeTable.update().values({
                             "latest_handshake": str(minus).split(".", maxsplit=1)[0],
                             "status": status
                         }).where(
-                            self.peersTable.columns.id == latestHandshake[count]
+                            self.peersRuntimeTable.columns.id == latestHandshake[count]
                         )
                     )
                 else:
                     conn.execute(
-                        self.peersTable.update().values({
+                        self.peersRuntimeTable.update().values({
                             "latest_handshake": "No Handshake",
                             "status": status
                         }).where(
-                            self.peersTable.columns.id == latestHandshake[count]
+                            self.peersRuntimeTable.columns.id == latestHandshake[count]
                         )
                     )
                 count += 2
@@ -792,7 +883,7 @@ class WireguardConfiguration:
         data_usage = subprocess.check_output(command, stderr=subprocess.STDOUT)
 
         data_usage = data_usage.decode("UTF-8").split("\n")
-        
+
         data_usage = [p.split("\t") for p in data_usage]
         cur_i = None
         with self.engine.begin() as conn:
@@ -810,7 +901,7 @@ class WireguardConfiguration:
                         cur_total_receive = float(data_usage[i][1]) / (1024 ** 3)
                         cumulative_receive = cur_i['cumu_receive'] + total_receive
                         cumulative_sent = cur_i['cumu_sent'] + total_sent
-                        if (total_sent * 0.999 ) <= cur_total_sent and (total_receive * 0.999) <= cur_total_receive: # An accuracy of 1K ppm is sufficient
+                        if (total_sent * 0.999) <= cur_total_sent and (total_receive * 0.999) <= cur_total_receive: # An accuracy of 1K ppm is sufficient
                             total_sent = cur_total_sent
                             total_receive = cur_total_receive
                         else:
@@ -839,8 +930,6 @@ class WireguardConfiguration:
                                     )
                                 )
 
-            
-
     def getPeersEndpoint(self):
         if not self.getStatus():
             self.toggleConfiguration()
@@ -855,10 +944,10 @@ class WireguardConfiguration:
         with self.engine.begin() as conn:
             for _ in range(int(len(data_usage) / 2)):
                 conn.execute(
-                    self.peersTable.update().values({
+                    self.peersRuntimeTable.update().values({
                         "endpoint": data_usage[count + 1]
                     }).where(
-                        self.peersTable.c.id == data_usage[count]
+                        self.peersRuntimeTable.c.id == data_usage[count]
                     )
                 )
                 count += 2
@@ -961,7 +1050,7 @@ class WireguardConfiguration:
         return backups
 
     def restoreBackup(self, backupFileName: str) -> bool:
-        backups = list(map(lambda x : x['filename'], self.getBackups()))
+        backups = list(map(lambda x: x['filename'], self.getBackups()))
         if backupFileName not in backups:
             return False
         if self.Status:
@@ -982,7 +1071,7 @@ class WireguardConfiguration:
         return True
 
     def deleteBackup(self, backupFileName: str) -> bool:
-        backups = list(map(lambda x : x['filename'], self.getBackups()))
+        backups = list(map(lambda x: x['filename'], self.getBackups()))
         if backupFileName not in backups:
             return False
         try:
@@ -992,7 +1081,7 @@ class WireguardConfiguration:
         return True
 
     def downloadBackup(self, backupFileName: str) -> tuple[bool, str] | tuple[bool, None]:
-        backup = list(filter(lambda x : x['filename'] == backupFileName, self.getBackups()))
+        backup = list(filter(lambda x: x['filename'] == backupFileName, self.getBackups()))
         if len(backup) == 0:
             return False, None
         zip = f'{str(uuid.UUID(int=random.Random().getrandbits(128), version=4))}.zip'
@@ -1045,7 +1134,7 @@ class WireguardConfiguration:
             return False, msg
         for i in allowEdit:
             setattr(self, i, str(newData[i]))
-                
+
         return True, ""
 
     def deleteConfiguration(self):
@@ -1060,9 +1149,9 @@ class WireguardConfiguration:
 
         if len(newConfigurationName) > 15 or not re.match(r'^[a-zA-Z0-9_=\+\.\-]{1,15}$', newConfigurationName):
             return False, "Configuration name is either too long or contains an illegal character"
-        
-        newConfigurationName = newConfigurationName.replace("`", "") # double check
-    
+
+        newConfigurationName = newConfigurationName.replace("`", "")  # double check
+
         try:
             if self.getStatus():
                 self.toggleConfiguration()
@@ -1079,6 +1168,7 @@ class WireguardConfiguration:
                     )
 
                 doRenameStatement("")
+                doRenameStatement("_runtime")
                 doRenameStatement("_restrict_access")
                 doRenameStatement("_deleted")
                 doRenameStatement("_transfer")
@@ -1178,14 +1268,14 @@ class WireguardConfiguration:
                     "recv": net_in
                 }
             else:
-                return { "sent": 0, "recv": 0 }
+                return {"sent": 0, "recv": 0}
         else:
-            return { "sent": 0, "recv": 0 }
-    
+            return {"sent": 0, "recv": 0}
+
     '''
     Manager WireGuard Configuration Information
     '''
-    
+
     def readConfigurationInfo(self):
         with self.engine.connect() as conn:
             result = conn.execute(
@@ -1194,7 +1284,7 @@ class WireguardConfiguration:
                 )
             ).mappings().fetchone()
         return result
-    
+
     def initConfigurationInfo(self):
         with self.engine.begin() as conn:
             conn.execute(
@@ -1205,7 +1295,7 @@ class WireguardConfiguration:
                     }
                 )
             )
-    
+
     def storeConfigurationInfo(self):
         try:
             with self.engine.begin() as conn:
@@ -1244,11 +1334,11 @@ class WireguardConfiguration:
             self.configurationInfo.PeerTrafficTracking = value
         elif key == "PeerHistoricalEndpointTracking":
             self.configurationInfo.PeerHistoricalEndpointTracking = value
-        else: 
+        else:
             return False, "Key does not exist", None
         self.storeConfigurationInfo()
         return True, None, None
-    
+
     def __validateOverridePeerSettings(self, key: str, value: str | int) -> tuple[bool, None] | tuple[bool, str]:
         status = True
         msg = None
@@ -1259,9 +1349,9 @@ class WireguardConfiguration:
         elif key == "ListenPort" and value:
             if not value.isnumeric() or not (1 <= int(value) <= 65535):
                 status = False
-                msg = "Listen Port must be >= 1 and <= 65535"        
+                msg = "Listen Port must be >= 1 and <= 65535"
         return status, msg
-        
+
     def getTransferTableSize(self):
         with self.engine.connect() as db:
             row_count = db.execute(
@@ -1275,7 +1365,7 @@ class WireguardConfiguration:
                 sqlalchemy.select(sqlalchemy.func.count()).select_from(self.peersHistoryEndpointTable)
             ).scalar()
             return int(row_count)
-        
+
     def downloadTransferTable(self):
         with self.engine.connect() as db:
             data = db.execute(
@@ -1289,13 +1379,13 @@ class WireguardConfiguration:
                 self.peersHistoryEndpointTable.select()
             ).mappings().fetchall()
             return data
-    
+
     def deleteTransferTable(self):
         try:
             with self.engine.begin() as db:
                 db.execute(
                     self.peersTransferTable.delete()
-            )
+                )
             with self.engine.connect() as conn:
                 if conn.dialect.name == 'sqlite':
                     print("[WGDashboard] SQLite Vacuuming Database")
