@@ -466,7 +466,6 @@ update_wgd() {
     local repo workdir version answer was_running=false status
     local updater="./release_update.py"
     local tag="${2:-}"
-    local -a prepare_args
 
     if ! command -v python3 >/dev/null 2>&1; then
         printf '[WGDashboard] Python 3 is required for updating.\n' >&2
@@ -479,6 +478,12 @@ update_wgd() {
 
     repo=$(python3 "$updater" metadata --workspace . --target . --field repository) || return 1
     workdir=$(mktemp -d) || return 1
+    # Keep the updater independent of files being replaced.
+    if ! cp -- "$updater" "$workdir/release_update.py"; then
+        rm -rf -- "$workdir"
+        return 1
+    fi
+    updater="$workdir/release_update.py"
     printf '[WGDashboard] Checking releases of %s\n' "$repo"
     local -a prepare_args=(prepare --repo "$repo" --workspace "$workdir")
 
