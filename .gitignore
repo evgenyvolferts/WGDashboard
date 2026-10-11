@@ -53,3 +53,5 @@ coverage
 
 *.tsbuildinfo
 .vite/*
+
+src/static/dist/
