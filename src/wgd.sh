@@ -618,4 +618,6 @@ else
 		help
 	fi
 fi
+exit_code=$?
 printf "%s\n" "$dashes"
+exit "$exit_code"
