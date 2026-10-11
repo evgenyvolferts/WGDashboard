@@ -1,0 +1,61 @@
+name: Frontend Build
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - master
+      - feature-release-assets
+
+jobs:
+  build:
+    name: Build ${{ matrix.frontend.name }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        frontend:
+          - name: Admin
+            directory: src/static/app
+            output: src/static/dist/WGDashboardAdmin
+            entrypoint: index.html
+          - name: Client
+            directory: src/static/client
+            output: src/static/dist/WGDashboardClient
+            entrypoint: client.html
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: ${{ matrix.frontend.directory }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.frontend.directory }}
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: ${{ matrix.frontend.directory }}
+        run: npm run build
+
+      - name: Check generated entrypoint
+        env:
+          OUTPUT: ${{ matrix.frontend.output }}
+          ENTRYPOINT: ${{ matrix.frontend.entrypoint }}
+        run: test -s "$OUTPUT/$ENTRYPOINT"
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: frontend-${{ matrix.frontend.name }}
+          path: ${{ matrix.frontend.output }}/
+          if-no-files-found: error
+          retention-days: 7
