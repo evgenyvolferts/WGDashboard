@@ -48,6 +48,7 @@ jobs:
         id: package
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
           mkdir -p staging/WGDashboard
@@ -55,6 +56,8 @@ jobs:
           mkdir -p staging/WGDashboard/src/static/dist
           cp -a src/static/dist/WGDashboardAdmin staging/WGDashboard/src/static/dist/
           cp -a src/static/dist/WGDashboardClient staging/WGDashboard/src/static/dist/
+          printf '[Release]\nversion = %s\nrepository = %s\n' \
+            "$RELEASE_TAG" "$RELEASE_REPOSITORY" > staging/WGDashboard/src/release.ini
           test -s staging/WGDashboard/src/static/dist/WGDashboardAdmin/index.html
           test -s staging/WGDashboard/src/static/dist/WGDashboardClient/client.html
           archive="WGDashboard-${RELEASE_TAG}.tar.gz"
