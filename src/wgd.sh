@@ -46,7 +46,6 @@ help () {
   printf "|    update: To update WGDashboard to the newest version from GitHub.           |\n"
   printf "|    install: To install WGDashboard.                                           |\n"
   printf "|    cleanup-orphan-tables: Preview or delete orphan SQLite configuration data. |\n"
-  printf "|    migrate-runtime: Migrate SQLite peer runtime tables (offline).             |\n"
   printf "| Thank you for using! Your support is my motivation ;)                         |\n"
   printf "=================================================================================\n"
 }
@@ -618,8 +617,6 @@ else
         	_determinePypiMirror
     elif [ "$1" = "cleanup-orphan-tables" ]; then
         python3 -m migrations.cleanup_orphan_tables "${@:2}" || exit $?
-    elif [ "$1" = "migrate-runtime" ]; then
-        python3 ./migrations/migrate_peer_runtime.py "${@:2}" || exit $?
 	else
 		help
 	fi
