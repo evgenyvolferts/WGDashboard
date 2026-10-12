@@ -1,0 +1,72 @@
+name: Release Assets
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build WGDashboard release archive
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            src/static/app/package-lock.json
+            src/static/client/package-lock.json
+
+      - name: Build Admin frontend
+        working-directory: src/static/app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build Client frontend
+        working-directory: src/static/client
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify frontend output
+        run: |
+          test -s src/static/dist/WGDashboardAdmin/index.html
+          test -s src/static/dist/WGDashboardClient/client.html
+
+      - name: Package release archive
+        id: package
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging/WGDashboard
+          git archive --format=tar HEAD | tar -xf - -C staging/WGDashboard
+          mkdir -p staging/WGDashboard/src/static/dist
+          cp -a src/static/dist/WGDashboardAdmin staging/WGDashboard/src/static/dist/
+          cp -a src/static/dist/WGDashboardClient staging/WGDashboard/src/static/dist/
+          printf '[Release]\nversion = %s\nrepository = %s\n' \
+            "$RELEASE_TAG" "$RELEASE_REPOSITORY" > staging/WGDashboard/src/release.ini
+          test -s staging/WGDashboard/src/static/dist/WGDashboardAdmin/index.html
+          test -s staging/WGDashboard/src/static/dist/WGDashboardClient/client.html
+          archive="WGDashboard-${RELEASE_TAG}.tar.gz"
+          tar -czf "$archive" -C staging WGDashboard
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload archive to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: gh release upload "$RELEASE_TAG" "$ARCHIVE" --clobber --repo "$GITHUB_REPOSITORY"

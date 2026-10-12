@@ -1,4 +1,25 @@
 #
+# FRONTEND BUILDING STAGE
+#
+FROM --platform=$BUILDPLATFORM node:24-alpine AS frontend-builder
+
+WORKDIR /build/app
+
+COPY src/static/app/package.json src/static/app/package-lock.json ./
+RUN npm ci
+
+COPY src/static/app/ ./
+RUN npm run build && test -s ../dist/WGDashboardAdmin/index.html
+
+WORKDIR /build/client
+
+COPY src/static/client/package.json src/static/client/package-lock.json ./
+RUN npm ci
+
+COPY src/static/client/ ./
+RUN npm run build && test -s ../dist/WGDashboardClient/client.html
+
+#
 # AWG GOLANG BUILDING STAGE
 # Base: Alpine
 #
@@ -123,6 +144,9 @@ RUN mkdir /data /configs -p ${WGDASH}/src /etc/amnezia/amneziawg \
 
 # Copy the venv and source files from local compiled locations or repos
 COPY ./src ${WGDASH}/src
+# Copy compiled frontend applications
+COPY --from=frontend-builder /build/dist/WGDashboardAdmin ${WGDASH}/src/static/dist/WGDashboardAdmin
+COPY --from=frontend-builder /build/dist/WGDashboardClient ${WGDASH}/src/static/dist/WGDashboardClient
 COPY --from=pip-builder /opt/wgdashboard/src/venv /opt/wgdashboard/src/venv
 COPY ./docker/wg0.conf.template /tmp/wg0.conf.template
 COPY ./docker/wg-dashboard-oidc-providers.json.template /tmp/wg-dashboard-oidc-providers.json.template

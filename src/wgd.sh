@@ -45,6 +45,7 @@ help () {
   printf "|    debug: To start WGDashboard in debug mode (i.e run in foreground).         |\n"
   printf "|    update: To update WGDashboard to the newest version from GitHub.           |\n"
   printf "|    install: To install WGDashboard.                                           |\n"
+  printf "|    cleanup-orphan-tables: Preview or delete orphan SQLite configuration data. |\n"
   printf "| Thank you for using! Your support is my motivation ;)                         |\n"
   printf "=================================================================================\n"
 }
@@ -463,46 +464,113 @@ start_wgd_debug() {
 }
 
 update_wgd() {
-	_determineOS
-	if ! python3 --version > /dev/null 2>&1
-	then
-		printf "[WGDashboard] Python is not installed, trying to install now\n"
-		_installPython
-	else
-		printf "[WGDashboard] %s Python is installed\n" "$heavy_checkmark"
-	fi
-	
-	_checkPythonVersion
-	_installPythonVenv
-	_installPythonPip	
-	
-	new_ver=$($venv_python -c "import json; import urllib.request; data = urllib.request.urlopen('https://api.github.com/repos/WGDashboard/WGDashboard/releases/latest').read(); output = json.loads(data);print(output['tag_name'])")
+    local repo workdir version answer was_running=false status
+    local updater="./release_update.py"
+    local tag="${2:-}"
 
-	if [ "$commandConfirmed" = "true" ]; then
-		printf "[WGDashboard] Confirmation granted.\n"
-		up="Y"
-	else
-		printf "[WGDashboard] Are you sure you want to update to the %s? (Y/N): " "$new_ver"
-		read up
-	fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        printf '[WGDashboard] Python 3 is required for updating.\n' >&2
+        return 1
+    fi
+    if [[ ! -f "$updater" ]]; then
+        printf '[WGDashboard] Missing %s; update is unavailable.\n' "$updater" >&2
+        return 1
+    fi
 
-	if [ "$up" = "Y" ] || [ "$up" = "y" ]; then
-		printf "[WGDashboard] Shutting down WGDashboard\n"
+    repo=$(python3 "$updater" metadata --workspace . --target . --field repository) || return 1
+    workdir=$(mktemp -d) || return 1
+    # Keep the updater independent of files being replaced.
+    if ! cp -- "$updater" "$workdir/release_update.py"; then
+        rm -rf -- "$workdir"
+        return 1
+    fi
+    updater="$workdir/release_update.py"
+    printf '[WGDashboard] Checking releases of %s\n' "$repo"
+    local -a prepare_args=(prepare --repo "$repo" --workspace "$workdir")
 
-		if check_wgd_status; then
-			stop_wgd
-		fi
+    if [[ -n "$tag" && "$tag" != "-y" && "$tag" != "-Y" ]]; then
+        prepare_args+=(--tag "$tag")
+    else
+        tag=""
+    fi
 
-		mv wgd.sh wgd.sh.old
-		printf "[WGDashboard] Downloading %s from GitHub..." "$new_ver"
-		{ date; git stash; git pull https://github.com/WGDashboard/WGDashboard.git $new_ver --force; } >> ./log/update.txt
-		chmod +x ./wgd.sh
-		sudo ./wgd.sh install
-		printf "[WGDashboard] Update completed!\n"
-		rm wgd.sh.old
-	else
-		printf "[WGDashboard] Update Canceled.\n"
-	fi
+    if ! python3 "$updater" "${prepare_args[@]}"; then
+        rm -rf -- "$workdir"
+        return 1
+    fi
+    version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tag"])' "$workdir/release.json") || {
+        rm -rf -- "$workdir"
+        return 1
+    }
+
+    status=$(python3 "$updater" compare --workspace "$workdir" --target .) || {
+        rm -rf -- "$workdir"
+        return 1
+    }
+    if [[ "$status" == same ]]; then
+        printf '[WGDashboard] Version %s is already installed.\n' "$version"
+        rm -rf -- "$workdir"
+        return 0
+    fi
+    if [[ "$status" == downgrade && -z "$tag" ]]; then
+        printf '[WGDashboard] Refusing automatic downgrade to %s.\n' "$version" >&2
+        rm -rf -- "$workdir"
+        return 1
+    fi
+    if [[ "$status" == downgrade ]]; then
+        printf '[WGDashboard] Warning: requested version %s is older than the installed version.\n' "$version"
+    fi
+
+    if [[ "$commandConfirmed" != true ]]; then
+        read -r -p "[WGDashboard] Update to ${version} from ${repo}? (Y/N): " answer
+        if [[ "$answer" != [Yy] ]]; then
+            printf '[WGDashboard] Update canceled.\n'
+            rm -rf -- "$workdir"
+            return 0
+        fi
+    fi
+
+    if check_wgd_status; then
+        was_running=true
+        stop_wgd
+    fi
+
+    if ! python3 "$updater" apply --workspace "$workdir" --target .; then
+        printf '[WGDashboard] Update failed; restoring application files.\n' >&2
+        python3 "$updater" rollback --workspace "$workdir" --target . || {
+            printf '[WGDashboard] Rollback failed; files retained in %s\n' "$workdir" >&2
+            return 1
+        }
+        [[ "$was_running" == true ]] && start_wgd
+        rm -rf -- "$workdir"
+        return 1
+    fi
+
+    # Use the existing venv if present, or create one; do not require Node.js.
+    if [[ ! -x "$venv_python" ]]; then
+        if ! python3 -m venv ./venv; then
+            printf '[WGDashboard] Failed to prepare Python environment.\n' >&2
+            python3 "$updater" rollback --workspace "$workdir" --target .
+            return 1
+        fi
+    fi
+    if ! "$venv_python" -m pip install -r requirements.txt; then
+        printf '[WGDashboard] Dependency installation failed; restoring application files.\n' >&2
+        python3 "$updater" rollback --workspace "$workdir" --target . || {
+            printf '[WGDashboard] Rollback failed; files retained in %s\n' "$workdir" >&2
+            return 1
+        }
+        [[ "$was_running" == true ]] && start_wgd
+        rm -rf -- "$workdir"
+        return 1
+    fi
+
+    chmod +x ./wgd.sh
+    rm -rf -- "$workdir"
+    if [[ "$was_running" == true ]]; then
+        start_wgd
+    fi
+    printf '[WGDashboard] Updated to %s successfully.\n' "$version"
 }
 
 
@@ -510,7 +578,7 @@ print_header
 if [ "$#" -lt 1 ]; then
 	help
 else
-	if [ "$2" = "-y" ] || [ "$2" = "-Y" ]; then
+	if [ "$2" = "-y" ] || [ "$2" = "-Y" ] || [ "${3:-}" = "-y" ] || [ "${3:-}" = "-Y" ]; then
 		commandConfirmed="true"
 	fi
 
@@ -527,7 +595,7 @@ else
 			printf "[WGDashboard] WGDashboard is not running.\n"
 		fi
 	elif [ "$1" = "update" ]; then
-		update_wgd
+		update_wgd "$@"
 	elif [ "$1" = "install" ]; then
 		install_wgd
 	elif [ "$1" = "restart" ]; then
@@ -547,8 +615,12 @@ else
     		_determineOS
     elif [ "$1" = "ping" ]; then
         	_determinePypiMirror
+    elif [ "$1" = "cleanup-orphan-tables" ]; then
+        python3 -m migrations.cleanup_orphan_tables "${@:2}" || exit $?
 	else
 		help
 	fi
 fi
+exit_code=$?
 printf "%s\n" "$dashes"
+exit "$exit_code"

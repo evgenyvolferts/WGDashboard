@@ -145,6 +145,15 @@ class WireguardConfiguration:
                 self.__parser["Interface"]["I3"] = self.I3
                 self.__parser["Interface"]["I4"] = self.I4
                 self.__parser["Interface"]["I5"] = self.I5
+                self.__parser["Interface"]["HeaderProtectionKey"] = self.HeaderProtectionKey
+                self.__parser["Interface"]["ContentPaddingAddition"] = self.ContentPaddingAddition
+                self.__parser["Interface"]["RekeyAfterTime"] = self.RekeyAfterTime
+                self.__parser["Interface"]["RekeyTimeout"] = self.RekeyTimeout
+                self.__parser["Interface"]["RejectAfterTime"] = self.RejectAfterTime
+                self.__parser["Interface"]["KeepaliveTimeout"] = self.KeepaliveTimeout
+                self.__parser["Interface"]["MaxHandshakeAttempts"] = self.MaxHandshakeAttempts
+                self.__parser["Interface"]["RandomTrailers"] = self.RandomTrailers
+                self.__parser["Interface"]["DisableCookies"] = self.DisableCookies
 
             if "Backup" not in data.keys():
                 self.createDatabase()
@@ -251,7 +260,7 @@ class WireguardConfiguration:
             self.Status = self.getStatus()
 
     def __dropDatabase(self):
-        existingTables = [self.Name, f'{self.Name}_runtime', f'{self.Name}_restrict_access', f'{self.Name}_transfer', f'{self.Name}_deleted']
+        existingTables = [self.Name, f'{self.Name}_runtime', f'{self.Name}_restrict_access', f'{self.Name}_transfer', f'{self.Name}_deleted', f'{self.Name}_history_endpoint']
         try:
             with self.engine.begin() as conn:
                 for t in existingTables:
@@ -346,7 +355,8 @@ class WireguardConfiguration:
             f'{dbName}_history_endpoint', self.metadata,
             sqlalchemy.Column('id', sqlalchemy.String(255), nullable=False),
             sqlalchemy.Column('endpoint', sqlalchemy.String(255), nullable=False),
-            sqlalchemy.Column('time', time_col_type)
+            sqlalchemy.Column('time', time_col_type),
+            extend_existing=True
         )
 
         self.infoTable = sqlalchemy.Table(
@@ -1031,8 +1041,8 @@ class WireguardConfiguration:
         files.sort(key=lambda x: x[1], reverse=True)
 
         for f, ct in files:
-            if RegexMatch(rf"^({self.Name})_(\d+)\\.(conf)$", f):
-                s = re.search(rf"^({self.Name})_(\d+)\\.(conf)$", f)
+            if RegexMatch(rf"^({self.Name})_(\d+)\.(conf)$", f):
+                s = re.search(rf"^({self.Name})_(\d+)\.(conf)$", f)
                 date = s.group(2)
                 d = {
                     "filename": f,
@@ -1105,7 +1115,7 @@ class WireguardConfiguration:
             original = [l.rstrip("\n") for l in f.readlines()]
             allowEdit = ["Address", "PreUp", "PostUp", "PreDown", "PostDown", "ListenPort", "Table"]
             if self.Protocol == 'awg':
-                allowEdit += ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"]
+                allowEdit += ["Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5", "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts", "RandomTrailers", "DisableCookies"]
             start = original.index("[Interface]")
             try:
                 end = original.index("[Peer]")
@@ -1170,6 +1180,7 @@ class WireguardConfiguration:
                 doRenameStatement("_restrict_access")
                 doRenameStatement("_deleted")
                 doRenameStatement("_transfer")
+                doRenameStatement("_history_endpoint")
 
             self.AllPeerJobs.updateJobConfigurationName(self.Name, newConfigurationName)
             shutil.copy(

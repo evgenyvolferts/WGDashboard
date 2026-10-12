@@ -162,6 +162,8 @@ yourname/wgdashboard latest    c96fd96ee3b3   42 minutes ago      314MB
 
 Here's a brief overview of the Dockerfile stages used in the image build:
 
+The Docker build also compiles both Vue frontends in a dedicated `node:24-alpine` build stage. It runs `npm ci` and `npm run build` in `src/static/app` (Admin) and `src/static/client` (Client), then copies the generated frontend assets into the final image. Node.js is used only during the build and is not included in the final runtime image.
+
 ### 1. **Build Tools & Go Compilation**
 
 ```Dockerfile
@@ -181,11 +183,32 @@ COPY --from=compiler /go/amneziawg-go/amneziawg-go /amneziawg-go
 ...
 ```
 
-### 3. **Final Alpine Container Setup**
+### 3. **Frontend Build (Node.js 24)**
+
+The Admin and Client Vue frontends are compiled in a separate Node.js build stage.
+
+```Dockerfile
+FROM node:24-alpine AS frontend-builder
+
+WORKDIR /build/src/static/app
+COPY src/static/app/package*.json ./
+RUN npm ci
+COPY src/static/app/ ./
+RUN npm run build
+
+WORKDIR /build/src/static/client
+COPY src/static/client/package*.json ./
+RUN npm ci
+COPY src/static/client/ ./
+RUN npm run build
+```
+
+### 4. **Final Alpine Container Setup**
 
 ```Dockerfile
 FROM alpine:latest
 COPY --from=bins ...
+COPY --from=frontend-builder ...
 RUN apk update && apk add --no-cache ...
 COPY ./src ${WGDASH}/src
 COPY ./docker/entrypoint.sh /entrypoint.sh
