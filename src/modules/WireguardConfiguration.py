@@ -260,17 +260,21 @@ class WireguardConfiguration:
             self.Status = self.getStatus()
 
     def __dropDatabase(self):
-        existingTables = [self.Name, f'{self.Name}_runtime', f'{self.Name}_restrict_access', f'{self.Name}_transfer', f'{self.Name}_deleted', f'{self.Name}_history_endpoint']
+        existingTables = [
+            self.Name,
+            f'{self.Name}_runtime',
+            f'{self.Name}_restrict_access',
+            f'{self.Name}_transfer',
+            f'{self.Name}_deleted',
+            f'{self.Name}_history_endpoint',
+        ]
         try:
             with self.engine.begin() as conn:
-                for t in existingTables:
-                    conn.execute(
-                        sqlalchemy.text(
-                            f'DROP TABLE "{t}"'
-                        )
-                    )
-        except Exception as e:
-            current_app.logger.error("Dropping table failed")
+                for name in existingTables:
+                    table = sqlalchemy.Table(name, sqlalchemy.MetaData())
+                    conn.execute(sqlalchemy.schema.DropTable(table, if_exists=True))
+        except Exception:
+            current_app.logger.exception("Dropping table failed")
             return False
         return True
 
@@ -375,11 +379,20 @@ class WireguardConfiguration:
                 rows = conn.execute(i.select()).mappings().fetchall()
                 for row in rows:
                     insert_stmt = i.insert().values(dict(row))
-                    yield str(insert_stmt.compile(compile_kwargs={"literal_binds": True}))
+                    yield str(
+                        insert_stmt.compile(
+                            dialect=self.engine.dialect,
+                            compile_kwargs={"literal_binds": True},
+                        )
+                    )
 
     def __importDatabase(self, sqlFilePath, restore=False) -> bool:
         if not restore:
-            self.__dropDatabase()
+            if not self.__dropDatabase():
+                raise RuntimeError(
+                    f"Failed to drop tables for configuration {self.Name}"
+                )
+
         self.createDatabase()
         if not os.path.exists(sqlFilePath):
             return False
